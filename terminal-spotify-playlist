@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+#
+# Given a playlist name and a list of song names, it will lookup for the songs
+# and add them to the playlist.
+# Spotify WebAPI is used to communicate with the Spotify cloud.
+#
+# @author   Gerik Bonaert
+# @license  MIT
+#
+# Depends on python, curl, xdg-open
+#
+
+# Spotify Client ID
+CLIENT_ID=
+# Spotify Client Secret
+CLIENT_SECRET=
+
+
+CALLBACK_PORT=34964
+CALLBACK_URI="http://localhost:${CALLBACK_PORT}"
+
+#
+# Prints usage
+#
+usage() {
+	cat <<EOF >&2
+Usage:
+	$0 [-c <access-code>] [-t <token>] <playlist-name>
+	
+Given a playlist name and a list of song names, it will lookup
+the songs and add them to the playlist.
+
+Your browser will pop-up if you do not do not provide the token
+on the command line.
+
+Example:
+	echo "Yellow Submarine,Beatles" | $0 "Beatles" 
+	$0 "Beatles" < /path/to/beatles/playlist
+EOF
+
+}
+
+#
+# Returns random alphanumeric characters
+# 
+# @param number of characters to return, default is 32
+#
+random_alphanumeric() {
+	< /dev/urandom tr -dc A-Za-z0-9 | head -c${1:-32}; echo
+}
+
+#
+# URI encodes strings
+# 
+# @param content to encode
+#
+rawurlencode() {
+	local string="${1}"
+	local strlen=${#string}
+	local encoded=""
+
+	for (( pos=0 ; pos<strlen ; pos++ )); do
+		c=${string:$pos:1}
+		case "$c" in
+			[-_.~a-zA-Z0-9]) o="${c}" ;;
+			*) printf -v o '%%%02x' "'$c"
+		esac
+		encoded+="${o}"
+	done
+	echo "${encoded}"
+}
+
+#
+# Authorizes the user to access the API
+#
+# @param client_id 
+# @param response_type
+# @param redirect_uri 
+# @param scopes
+# @param state
+#
+authorize() {
+	local client_id=$(rawurlencode "$1")
+	local response_type=$(rawurlencode "$2")
+	local redirect_uri=$(rawurlencode "$3")
+	local scopes=$(rawurlencode "$4")
+	local state=$(rawurlencode "$5")
+
+	xdg-open "https://accounts.spotify.com/authorize?client_id=$client_id&response_type=$response_type&redirect_uri=$redirect_uri&scope=$scopes&state=$state" 2> /dev/null
+}
+
+#
+# Startup a python server and wait for the response
+# 
+# @param port
+#
+wait_for_access_code() {
+	local port=${1:-34964}
+	cat <<'PYTHON_SERVER' | python - $port
+import BaseHTTPServer
+from sys import argv
+from urlparse import urlparse
+
+
+PORT = int(argv[1])
+class CallbackHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+	def do_GET(self):
+		query = urlparse(self.path).query
+		query_components = dict(qc.split("=") for qc in query.split("&"))
+		if 'code' in query_components.keys():
+			print query_components["code"]
+
+server = BaseHTTPServer.HTTPServer(("", PORT), CallbackHandler)
+server.handle_request()
+
+PYTHON_SERVER
+
+}
+
+#
+# Obtains an authorization code
+#
+# @param client_id
+# @param client_secret
+# @param code
+# @param redirect_uri
+# @return token 
+#
+obtain_token() {
+	local client_id="$1"
+	local client_secret="$2"
+	local code=$(rawurlencode "$3")
+	local redirect_uri=$(rawurlencode "$4")
+
+	curl -L \
+		--silent \
+		--request POST \
+		--header "Authorization: Basic $(echo -n "$client_id:$client_secret" | base64 -w0)" \
+		--data "grant_type=authorization_code&code=$code&redirect_uri=$redirect_uri" \
+		"https://accounts.spotify.com/api/token" \
+	| python -c "exec(\"import json,sys\\nobj=json.load(sys.stdin)\\nif 'access_token' in obj.keys():\\n  print obj['access_token']\\n\")"
+
+}
+
+#
+# Searches for a track
+# 
+# @param token
+# @param search term
+# @param track id
+#
+search_track() {
+	token="$1"
+	query=$(rawurlencode "$2")
+	curl \
+		--silent \
+		--header "Authorization: Bearer $token" \
+		"https://api.spotify.com/v1/search?q=$query&type=track&limit=1" \
+	| python -c "exec(\"import json,sys\\nobj=json.load(sys.stdin)\\nif 'tracks' in obj.keys() and len(obj['tracks']['items']) > 0:\\n  print obj['tracks']['items'][0]['id']\\n\")"
+}
+
+#
+# Get user id
+#
+# @param token
+# @return user id
+#
+get_user_id() {
+	token="$1"
+	curl \
+		--silent \
+		--header "Authorization: Bearer $token" \
+		"https://api.spotify.com/v1/me" \
+	| python -c "exec(\"import json,sys\\nobj=json.load(sys.stdin)\\nif 'id' in obj.keys():\\n  print obj['id']\\n\")"
+}
+
+#
+# Obtain playlist
+#
+# @param token
+# @param user_id
+# @param playlist
+# @return playlist_id
+#
+get_playlist() {
+	token="$1"
+	userid=$(rawurlencode "$2")
+	playlist="$3"
+	curl \
+		--silent \
+		--header "Authorization: Bearer $token" \
+		"https://api.spotify.com/v1/users/$userid/playlists" \
+	| python -c "exec(\"import json,sys\\nobj=json.load(sys.stdin)\\nif 'items' in obj.keys():\\n  for item in obj['items']:\\n    if item['name'] == '$playlist':\\n      print item['id']\\n\")"
+}
+
+#
+# Create playlist
+#
+# @param token
+# @param user_id
+# @param playlist name
+# @return playlist_id
+#
+create_playlist() {
+	token="$1"
+	userid=$(rawurlencode "$2")
+	playlist="$3"
+	curl \
+		--silent \
+		--request POST \
+		--header "Authorization: Bearer $token" \
+		--data "{\"name\": \"$playlist\", \"public\": false}" \
+		"https://api.spotify.com/v1/users/$userid/playlists" \
+	| python -c "exec(\"import json,sys\\nobj=json.load(sys.stdin)\\nif 'id' in obj.keys():\\n  print obj['id']\\n\")"
+}
+
+
+#
+# Add track
+#
+# @param token
+# @param userid
+# @param playlist
+# @param track
+# @return http status code [201 = OK]
+#
+add_track() {
+	token=$1
+	userid=$(rawurlencode "$2")
+	playlist=$(rawurlencode "$3")
+	track=$(rawurlencode "spotify:track:$4")
+
+	curl --silent \
+		--request POST \
+		--header "Authorization: Bearer $token" \
+		--write-out "%{http_code}" \
+		--output /dev/null \
+		"https://api.spotify.com/v1/users/$userid/playlists/$playlist/tracks?uris=$track" 
+}
+
+
+while getopts ":c:t:" opt; do
+	case $opt in
+		c)
+			ACCESS_CODE=$OPTARG;
+			;;
+		t)
+			TOKEN=$OPTARG;
+	esac
+done
+shift "$((OPTIND-1))"
+
+if [ -z "$CLIENT_ID" ]; then
+	cat <<EOT >&2
+You must provide a "Spotify Client ID". Have a look at the first lines
+of the script.
+
+You can create one at:
+	https://developer.spotify.com/my-applications
+
+A premium account is *NOT* required.
+EOT
+	exit;
+fi
+
+if [ -z "$CLIENT_SECRET" ]; then
+	cat <<EOT >&2
+You must provide a "Spotify Client Secret". Have a look at the first lines
+of the script.
+
+You can create one at:
+	https://developer.spotify.com/my-applications
+
+A premium account is *NOT* required.
+EOT
+	exit;
+fi
+
+if [ -z $1 ]; then
+	usage;
+	exit;
+fi
+
+PLAYLIST_NAME=$1
+
+if [[ -z "$ACCESS_CODE" && -z "$TOKEN" ]]; then
+	authorize "$CLIENT_ID" "code" "$CALLBACK_URI" "playlist-modify playlist-modify-private playlist-read-private user-library-modify user-library-read" "$(random_alphanumeric 16)"
+	
+	ACCESS_CODE=$(wait_for_access_code "$CALLBACK_PORT")
+	
+	if [ -z "$ACCESS_CODE" ]; then
+		echo "ERROR: Unable to obtain a Spotify authorization code" >&2
+		exit
+	fi
+	echo "Access code:   $ACCESS_CODE"
+fi
+
+if [[ -z "$TOKEN" ]]; then
+
+	TOKEN=$(obtain_token "$CLIENT_ID" "$CLIENT_SECRET" "$ACCESS_CODE" "$CALLBACK_URI")
+	
+	if [ -z "$TOKEN" ]; then
+		echo "ERROR: Unable to obtain a Spotify access token" >&2
+		exit
+	fi
+fi
+
+echo "Token:         $TOKEN"
+
+USER_ID=$(get_user_id "$TOKEN")
+
+echo "User ID:       $USER_ID"
+
+PLAYLIST_ID=$(get_playlist "$TOKEN" "$USER_ID" "$PLAYLIST_NAME") 
+
+
+if [ -z "$PLAYLIST_ID" ]; then
+	PLAYLIST_ID=$(create_playlist "$TOKEN" "$USER_ID" "$PLAYLIST_NAME")
+	if [ -z "$PLAYLIST_ID" ]; then
+		echo "ERROR: Could not create playlist $PLAYLIST_NAME" >&2
+		exit;
+	fi
+fi
+
+echo "Playlist ID:   $PLAYLIST_ID"
+
+while read line; do
+	result=""
+	song=$(echo $line | cut -d ',' -f1)
+	artist=$(echo $line | cut -d ',' -f2)
+	TRACK=$(search_track "$TOKEN" "$song $artist")
+	if [ -z "$TRACK" ]; then
+		echo "NOT FOUND   => $artist - $song" >&2
+	else
+		RESULT=$(add_track "$TOKEN" "$USER_ID" "$PLAYLIST_ID" "$TRACK")
+		if [ "201" != "$RESULT" ]; then
+			echo "ERROR [$RESULT] => $artist $song" >&2
+		else 
+			echo "ADDED       => $artist $song"
+		fi
+	fi
+done
+
+
